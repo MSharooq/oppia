@@ -21,12 +21,15 @@
 
 from __future__ import annotations
 
+import io
 import tempfile
+import tokenize
 import unittest
 
 import astroid
-from pylint import interfaces, testutils
+from pylint import interfaces, lint, testutils
 from pylint import utils as pylint_utils
+from pylint.reporters import collecting_reporter
 
 from . import pylint_extensions
 
@@ -70,6 +73,34 @@ class HangingIndentCheckerTests(CheckerTestBase):
             pylint_extensions.HangingIndentChecker
         )
         self.checker_test_object.setup_method()
+
+    def test_multiline_condition_with_a_comment_is_excluded(self) -> None:
+        tokens = list(
+            tokenize.generate_tokens(
+                io.StringIO(
+                    'if (first  # A condition.\n'
+                    '        and second):\n'
+                    '    pass\n'
+                ).readline
+            )
+        )
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.process_tokens(tokens)
+
+    def test_argument_before_inline_comment_requires_a_line_break(self) -> None:
+        tokens = list(
+            tokenize.generate_tokens(
+                io.StringIO(
+                    'function(first,  # An argument.\n    second)\n'
+                ).readline
+            )
+        )
+        with self.checker_test_object.assertAddsMessages(
+            testutils.MessageTest(
+                msg_id='no-break-after-hanging-indent', line=1
+            )
+        ):
+            self.checker_test_object.checker.process_tokens(tokens)
 
     def test_no_break_after_hanging_indentation(self) -> None:
         node_break_after_hanging_indent = self._build_module_node()
@@ -253,6 +284,41 @@ class DocstringParameterCheckerTests(CheckerTestBase):
             pylint_extensions.DocstringParameterChecker
         )
         self.checker_test_object.setup_method()
+
+    def test_constructor_named_function_outside_class(self) -> None:
+        node = astroid.extract_node(
+            """
+            def __init__():
+                \"\"\"Initialize the module.\"\"\"
+                pass
+            """
+        )
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.visit_functiondef(node)
+
+    def test_function_without_docstring_has_no_indentation_errors(self) -> None:
+        node = astroid.extract_node('def function():\n    pass')
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.check_docstring_section_indentation(
+                node
+            )
+
+    def test_return_section_without_a_type_is_ignored(self) -> None:
+        node = astroid.extract_node(
+            """
+            def function():
+                \"\"\"Return a value.
+
+                Returns:
+                    Not a type declaration
+                \"\"\"
+                return 1
+            """
+        )
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.check_docstring_section_indentation(
+                node
+            )
 
     def test_no_newline_below_class_docstring(self) -> None:
         node_no_newline_below_class_docstring = self._build_module_node()
@@ -4354,6 +4420,11 @@ class InequalityWithNoneCheckerTests(CheckerTestBase):
         )
         self.checker_test_object.setup_method()
 
+    def test_inequality_with_a_name_does_not_add_message(self) -> None:
+        node = astroid.extract_node('left != right')
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.visit_compare(node)
+
     def test_inequality_op_on_none_adds_message(self) -> None:
         if_node = astroid.extract_node(
             """
@@ -4667,6 +4738,11 @@ class DisallowHandlerWithoutSchemaTests(CheckerTestBase):
         )
         self.checker_test_object.setup_method()
 
+    def test_non_handler_class_does_not_require_schemas(self) -> None:
+        node = astroid.extract_node('class OrdinaryClass:\n    pass')
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.visit_classdef(node)
+
     def test_schema_handlers_without_request_args_raise_error(self) -> None:
 
         schemaless_class_node = astroid.extract_node(
@@ -4869,6 +4945,11 @@ class DisallowedImportsCheckerTests(CheckerTestBase):
         )
         self.checker_test_object.setup_method()
 
+    def test_text_import_from_another_module_is_allowed(self) -> None:
+        node = astroid.extract_node('from example import Text')
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.visit_importfrom(node)
+
     def test_importing_text_from_typing_in_single_line_raises_error(
         self,
     ) -> None:
@@ -4918,6 +4999,11 @@ class PreventStringConcatenationCheckerTests(CheckerTestBase):
             pylint_extensions.PreventStringConcatenationChecker
         )
         self.checker_test_object.setup_method()
+
+    def test_string_multiplication_does_not_require_interpolation(self) -> None:
+        node = astroid.extract_node('\'text\' * 3')
+        with self.checker_test_object.assertNoMessages():
+            self.checker_test_object.checker.visit_binop(node)
 
     def test_encourages_interpolation_when_joining_multiple_strings(
         self,
@@ -5013,6 +5099,35 @@ class PreventStringConcatenationCheckerTests(CheckerTestBase):
 
         with self.checker_test_object.assertNoMessages():
             self.checker_test_object.checker.visit_binop(expression_node)
+
+
+class RegisterTests(unittest.TestCase):
+    """Tests that Pylint can load and use the custom checkers."""
+
+    def test_loading_plugin_enables_custom_checks(self) -> None:
+        reporter = collecting_reporter.CollectingReporter()
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', encoding='utf-8'
+        ) as source_file:
+            source_file.write('value = "example"\n')
+            source_file.flush()
+            lint.Run(
+                [
+                    '--rcfile=/dev/null',
+                    '--persistent=no',
+                    '--load-plugins=scripts.linters.pylint_extensions',
+                    '--disable=all',
+                    '--enable=invalid-string-quote',
+                    source_file.name,
+                ],
+                reporter=reporter,
+                exit=False,
+            )
+
+        self.assertEqual(
+            [(message.symbol, message.line) for message in reporter.messages],
+            [('invalid-string-quote', 1)],
+        )
 
 
 class QuoteConventionCheckerTests(CheckerTestBase):

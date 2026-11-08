@@ -18,17 +18,18 @@
 
 from __future__ import annotations
 
-import multiprocessing
+import multiprocessing.managers
 import os
 import subprocess
 import sys
+import tempfile
 
 from core.tests import test_utils
 
 from typing import List, Optional
 
 from .. import concurrent_task_utils, install_third_party_libs
-from . import run_lint_checks
+from . import general_purpose_linter, run_lint_checks
 
 os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '1'
 
@@ -158,7 +159,7 @@ class PreCommitLinterTests(test_utils.LinterTestBase):
             unused_path: str,
             namespace: multiprocessing.managers.Namespace,  # pylint: disable=unused-argument
         ) -> List[str]:
-            return ['mock_file', 'mock_file']
+            return ['unique_file', 'mock_file', 'mock_file']
 
         def mock_install_third_party_main() -> None:
             raise AssertionError('Third party libs should not be installed.')
@@ -330,6 +331,36 @@ class PreCommitLinterTests(test_utils.LinterTestBase):
                         '--only_check_file_extensions=ts',
                     ]
                 )
+
+    def test_get_all_files_in_directory_excludes_matching_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            included_path = os.path.join(directory, 'included.py')
+            excluded_path = os.path.join(directory, 'excluded.py')
+            for filepath in (included_path, excluded_path):
+                with open(filepath, 'w', encoding='utf-8'):
+                    pass
+
+            # Check filtering before the paths are passed to any linter.
+            filepaths = run_lint_checks._get_all_files_in_directory(  # pylint: disable=protected-access
+                directory, ['**/excluded.py']
+            )
+
+        self.assertEqual(filepaths, [os.path.relpath(included_path)])
+
+    def test_unknown_extension_uses_only_general_checks(self) -> None:
+        namespace = multiprocessing.managers.Namespace()
+        # Exercise selection without running external linter processes.
+        custom_linters, third_party_linters = (
+            run_lint_checks._get_linters_for_file_extension(  # pylint: disable=protected-access
+                'txt', namespace, {'.txt': ['notes.txt']}
+            )
+        )
+
+        self.assertEqual(len(custom_linters), 1)
+        self.assertIsInstance(
+            custom_linters[0], general_purpose_linter.GeneralPurposeLinter
+        )
+        self.assertEqual(third_party_linters, [])
 
     def test_html_file(self) -> None:
         with self.print_swap, self.sys_swap, self.install_swap:
